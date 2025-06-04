@@ -66,6 +66,11 @@ def main() -> None:
         action="store_true",
         help="print the git short hash and commit time",
     )
+    parser.add_argument(
+        "--find-arc",
+        action="store_true",
+        help="show the Arc Browser data directory path and exit",
+    )
 
     args = parser.parse_args()
 
@@ -85,6 +90,20 @@ def main() -> None:
         print(
             f"{Colors.BOLD}GIT HASH{Colors.RESET} | {Colors.MAGENTA}{commit_hash}{Colors.RESET}"
         )
+        return
+
+    if args.find_arc:
+        try:
+            arc_path = find_arc_data_path()
+            print(
+                f"{Colors.BOLD}Arc Data Path{Colors.RESET}: {Colors.CYAN}{arc_path}{Colors.RESET}"
+            )
+            if arc_path.exists():
+                print(f"{Colors.GREEN}✓ File found{Colors.RESET}")
+            else:
+                print(f"{Colors.RED}✗ File not found{Colors.RESET}")
+        except FileNotFoundError as e:
+            print(f"{Colors.RED}Error: {e}{Colors.RESET}")
         return
 
     data: dict = read_json()
@@ -124,49 +143,195 @@ def get_version() -> tuple[str, datetime]:
     return commit_hash, commit_time
 
 
+def find_arc_data_path() -> Path:
+    """Find the Arc Browser data directory based on the operating system."""
+    filename = "StorableSidebar.json"
+
+    # Check if we're running in WSL
+    is_wsl = (
+        os.path.exists("/proc/version")
+        and "microsoft" in open("/proc/version").read().lower()
+    )
+
+    if os.name == "nt" or is_wsl:
+        # Windows or WSL: Arc data is stored in AppData\Local\Packages
+        try:
+            if is_wsl:
+                # In WSL, access Windows filesystem through /mnt/c/
+                # Try to get Windows username from environment or use common paths
+                possible_usernames = []
+
+                # Try to get from Windows environment variables if available
+                if "WSLENV" in os.environ:
+                    # Try common Windows username environment variables
+                    for var in ["USERNAME", "USER"]:
+                        if var in os.environ:
+                            possible_usernames.append(os.environ[var])
+
+                # Add current WSL username as fallback
+                possible_usernames.append(os.environ.get("USER", "manny"))
+
+                # Try each possible username
+                arc_root_parent_path = None
+                for username in possible_usernames:
+                    test_path = Path(f"/mnt/c/Users/{username}/AppData/Local/Packages")
+                    if test_path.exists():
+                        arc_root_parent_path = test_path
+                        logging.debug(
+                            f"WSL detected, using Windows path via /mnt/c/ with username: {username}"
+                        )
+                        break
+
+                if arc_root_parent_path is None:
+                    # Last resort: try to find any Users directory
+                    users_dir = Path("/mnt/c/Users")
+                    if users_dir.exists():
+                        user_dirs = [
+                            d
+                            for d in users_dir.iterdir()
+                            if d.is_dir() and not d.name.startswith(".")
+                        ]
+                        for user_dir in user_dirs:
+                            test_path = user_dir / "AppData" / "Local" / "Packages"
+                            if test_path.exists():
+                                arc_root_parent_path = test_path
+                                logging.debug(f"WSL: Found AppData at {test_path}")
+                                break
+
+                if arc_root_parent_path is None:
+                    raise FileNotFoundError(
+                        "Could not find Windows AppData directory from WSL"
+                    )
+
+            else:
+                # Native Windows
+                arc_root_parent_path = Path(
+                    os.path.expanduser(r"~\AppData\Local\Packages")
+                )
+        except Exception as e:
+            logging.error(f"Failed to access AppData directory: {e}")
+            raise FileNotFoundError("Cannot access Windows AppData directory")
+
+        if not arc_root_parent_path.exists():
+            logging.debug(
+                f"AppData packages directory not found: {arc_root_parent_path}"
+            )
+            raise FileNotFoundError("Windows AppData packages directory not found")
+
+        try:
+            # Look for Arc packages with pattern: TheBrowserCompany.Arc_*
+            arc_root_paths = [
+                f
+                for f in arc_root_parent_path.glob("TheBrowserCompany.Arc_*")
+                if f.is_dir()
+            ]
+
+            # Fallback: also check for packages that start with "TheBrowserCompany.Arc"
+            if len(arc_root_paths) == 0:
+                arc_root_paths = [
+                    f
+                    for f in arc_root_parent_path.glob("*")
+                    if f.name.startswith("TheBrowserCompany.Arc") and f.is_dir()
+                ]
+
+        except PermissionError:
+            logging.error("Permission denied accessing AppData packages directory")
+            raise FileNotFoundError("Permission denied accessing Arc data directory")
+
+        if len(arc_root_paths) == 0:
+            logging.error("No Arc installation found in Windows AppData.")
+            logging.debug(f"Searched in: {arc_root_parent_path}")
+            # Look for any Browser Company packages
+            try:
+                available_packages = [
+                    f.name
+                    for f in arc_root_parent_path.glob("TheBrowserCompany*")
+                    if f.is_dir()
+                ]
+                if available_packages:
+                    logging.debug(f"Found related packages: {available_packages}")
+                else:
+                    logging.debug("No TheBrowserCompany packages found")
+            except Exception:
+                pass
+            raise FileNotFoundError(
+                "Arc Browser not found on Windows/WSL. Expected package like 'TheBrowserCompany.Arc_*'"
+            )
+        elif len(arc_root_paths) > 1:
+            logging.warning(
+                f"Multiple Arc installations found: {[p.name for p in arc_root_paths]}"
+            )
+            # Sort by modification time and use the most recent one
+            arc_root_paths.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+            logging.info(f"Using most recent: {arc_root_paths[0].name}")
+
+        selected_arc_path = arc_root_paths[0]
+        library_path = selected_arc_path / "LocalCache" / "Local" / "Arc" / filename
+        if is_wsl:
+            logging.debug(f"WSL Arc data path: {library_path}")
+        else:
+            logging.debug(f"Windows Arc data path: {library_path}")
+        logging.debug(f"Using Arc package: {selected_arc_path.name}")
+
+    else:
+        # macOS/Linux: Arc data is stored in Application Support
+        library_path = (
+            Path(os.path.expanduser("~/Library/Application Support/Arc/")) / filename
+        )
+        logging.debug(f"macOS/Linux Arc data path: {library_path}")
+
+    return library_path
+
+
 def read_json() -> dict:
     logging.info("Reading JSON...")
 
-    filename: Path = Path("StorableSidebar.json")
-    if os.name == "nt":
-        arc_root_parent_path: Path = Path(
-            os.path.expanduser(r"~\AppData\Local\Packages")
-        )
-        arc_root_paths: list[Path] = [
-            f
-            for f in arc_root_parent_path.glob("*")
-            if f.name.startswith("TheBrowserCompany.Arc")
-        ]
-        if len(arc_root_paths) != 1:
-            raise FileNotFoundError
+    filename = Path("StorableSidebar.json")
+    data = {}
 
-        library_path: Path = Path(
-            arc_root_paths[0].joinpath(r"LocalCache\Local\Arc")
-        ).joinpath(filename)
-
-    else:
-        library_path: Path = Path(
-            os.path.expanduser("~/Library/Application Support/Arc/")
-        ).joinpath(filename)
-
-    data: dict = {}
-
+    # First check if file exists in current directory
     if filename.exists():
         with filename.open("r", encoding="utf-8") as f:
             logging.debug(f"Found {filename} in current directory.")
             data = json.load(f)
-
-    elif library_path.exists():
-        with library_path.open("r", encoding="utf-8") as f:
-            logging.debug(f"Found {filename} in Library directory.")
-            data = json.load(f)
-
     else:
-        logging.critical(
-            '> File not found. Look for the "StorableSidebar.json" '
-            '  file within the "~/Library/Application Support/Arc/" folder.'
-        )
-        raise FileNotFoundError
+        # Look for file in Arc's data directory
+        try:
+            library_path = find_arc_data_path()
+            if library_path.exists():
+                with library_path.open("r", encoding="utf-8") as f:
+                    if os.name == "nt":
+                        logging.debug(
+                            f"Found {filename.name} in Windows Arc data directory."
+                        )
+                    else:
+                        logging.debug(
+                            f"Found {filename.name} in Arc Library directory."
+                        )
+                    data = json.load(f)
+            else:
+                raise FileNotFoundError(f"Arc data file not found at: {library_path}")
+
+        except FileNotFoundError as e:
+            # Check if we're in WSL for better error messages
+            is_wsl = (
+                os.path.exists("/proc/version")
+                and "microsoft" in open("/proc/version").read().lower()
+            )
+
+            if os.name == "nt" or is_wsl:
+                logging.critical(
+                    '> File not found. Look for the "StorableSidebar.json" '
+                    "  file within the Arc Browser data folder:\n"
+                    '  Windows: "C:\\Users\\[USERNAME]\\AppData\\Local\\Packages\\TheBrowserCompany.Arc_*\\LocalCache\\Local\\Arc\\"\n'
+                    '  WSL: "/mnt/c/Users/[USERNAME]/AppData/Local/Packages/TheBrowserCompany.Arc_*/LocalCache/Local/Arc/"'
+                )
+            else:
+                logging.critical(
+                    '> File not found. Look for the "StorableSidebar.json" '
+                    '  file within the "~/Library/Application Support/Arc/" folder.'
+                )
+            raise e
 
     return data
 
@@ -208,9 +373,9 @@ def get_spaces(spaces: list) -> dict:
             for i in range(len(containers)):
                 if isinstance(containers[i], dict):
                     if "pinned" in containers[i]:
-                        spaces_names["pinned"][str(containers[i + 1])]: str = title
+                        spaces_names["pinned"][str(containers[i + 1])] = title
                     elif "unpinned" in containers[i]:
-                        spaces_names["unpinned"][str(containers[i + 1])]: str = title
+                        spaces_names["unpinned"][str(containers[i + 1])] = title
 
             spaces_count += 1
 
