@@ -169,7 +169,7 @@ def find_arc_data_path() -> Path:
                             possible_usernames.append(os.environ[var])
 
                 # Add current WSL username as fallback
-                possible_usernames.append(os.environ.get("USER", "manny"))
+                possible_usernames.append(os.environ.get("USER", "user"))
 
                 # Try each possible username
                 arc_root_parent_path = None
